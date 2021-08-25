@@ -1,6 +1,7 @@
 import unittest
 from read_Kp import *
 from read_cdf import *
+from model import *
 
 class Tests(unittest.TestCase):
 
@@ -124,7 +125,7 @@ class Tests(unittest.TestCase):
                            [1, 6, 11]])
         interpolated = interpolated_PSD(L, t, Li, ts, F_bars)
 
-        self.assertEqual(interpolated, 7)
+        self.assertAlmostEqual(interpolated, 7.333270549944682)
 
     def test_complete_PSD(self):
         Li = [3, 4, 5]
@@ -145,11 +146,47 @@ class Tests(unittest.TestCase):
                    datetime.datetime(2000, 1, 1, 13, 0))
         nTimes = 2
         times, complete = complete_PSD(Li, ts, F_bars, t_range, nTimes)
-        correct = np.array([[7, 8, 3], [1, 6, 6.6]])
+        correct = np.array([[6.839904, 7.862224, 3], [1, 6, 0]])
         self.assertEqual(times, [datetime.datetime(2000, 1, 1, 8, 0),
                                  datetime.datetime(2000, 1, 1, 13, 0)])
         np.testing.assert_allclose(complete, correct)
 
+    def test_interpolate_1D(self):
+        xi = [2, 4, 7]
+        fi = [6, 8, 2]
+        self.assertAlmostEqual(interpolate1D(xi, fi, 2), 6)
+        self.assertAlmostEqual(interpolate1D(xi, fi, 3), 7)
+        self.assertAlmostEqual(interpolate1D(xi, fi, 5), 6)
+        self.assertAlmostEqual(interpolate1D(xi, fi, 7), 2)
+
+
+    def test_interpolate_2D(self):
+        xi = [2, 5, 8]
+        yi = [4, 8, 12, 16]
+        fi = np.array([[1, 16, 8, 3], [12, 4, 0, 8], [7, 3, 19, 7]])
+        self.assertAlmostEqual(interpolate2D(xi, yi, fi, 2, 4), 1)
+        self.assertAlmostEqual(interpolate2D(xi, yi, fi, 3, 11), 7)
+        self.assertAlmostEqual(interpolate2D(xi, yi, fi, 6, 6), 7)
+        self.assertAlmostEqual(interpolate2D(xi, yi, fi, 8, 16), 7)
+
+    def test_diffusion(self):
+        LRange = (3.5, 4.5)
+        tRange = (0, 2)
+        nL = 3
+        nT = 2
+        f0 = lambda L: 1e-7 * (100**L)
+        def D_LL(L, Kpt):
+            return L*Kpt + 1
+        def tau(L, Kpt):
+            return Kpt
+        uL = lambda t: 2**(t/2)
+        uR = lambda t: 100*(2**(-t/2))
+        Kp = lambda t: t/2
+        u_correct = np.array([[1., 2.], [10., 23.45021064], [100., 50.]])
+        Li, u = solve_diffusion(LRange, tRange, nL, nT, f0, D_LL, tau, uL, uR,
+                                Kp)
+        np.testing.assert_almost_equal(Li, np.array([3.5, 4.0, 4.5]))
+        np.testing.assert_almost_equal(u, u_correct)
 
 
 

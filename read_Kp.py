@@ -22,12 +22,13 @@ def read_Kp(path):
     return Kp_data
 
 if __name__ == "__main__":
-    Kp_data = read_Kp("sep2017/Kp/Kp_data.lst")
+    # Kp_data = read_Kp("sep2017/Kp/Kp_data.lst")
+    Kp_data = read_Kp("week/Kp_data.lst")
     t0 = min(Kp_data.keys())
     tf = min(Kp_data.keys())
     import numpy as np
-    time = np.array(list(Kp_data.keys()))
-    Kp = np.array(list(Kp_data.values()))
+    time = [key/24 + 1 for key in Kp_data.keys()]
+    Kp = Kp_data.values()
     import matplotlib.pyplot as plt
     plt.plot(time, Kp)
     plt.show()

@@ -1,6 +1,7 @@
 import numpy as np
 from spacepy import pycdf
 import matplotlib.pyplot as plt
+import os
 import datetime
 import math
 
@@ -118,8 +119,13 @@ def find_min_max_times(ts):
         times = [t for t in ts[:, i] if isinstance(t, datetime.datetime)]
         mintimes.append(np.min(times, axis=0))
         maxtimes.append(np.max(times, axis=0))
+    plt.plot([i for i in range(len(mintimes))], mintimes)
     mintime = max(mintimes)
     maxtime = min(maxtimes)
+    # print(mintimes)
+    # print(np.argmax(mintimes))
+    # print(mintime)
+    # print(5/0)
     return mintime, maxtime
 
 def time_linspace(mintime, maxtime, nTimes):
@@ -143,41 +149,60 @@ def interpolated_PSD(L, t, Li, ts, F_bars):
     """
     # So L is between L_m and L_{m+1}, and t is between t_n and t_{n+1}
     DL = (Li[-1] - Li[0]) / (len(Li) - 1)
-    m = math.floor((L-Li[0])/DL)
-    assert(m < len(Li))
-    # Find the PSD at L_m, t
-    n = None
-    for i in range(ts.shape[0]):
-        if isinstance(ts[i, m], datetime.datetime) and isinstance(ts[i-1, m], datetime.datetime):
-            if t <= ts[i, m]:
-                n = i - 1
-                break
-    if n is None or n == -1:
-        if t == ts[0, m]:
+    m = math.ceil((L-Li[0])/DL) - 1
+    if m == -1:
+        assert(L == Li[0])
+        m += 1
+    L_m = Li[m]
+    assert(L_m <= L)
+    # First we'll consider L_m
+    present_indices = [i for i, t in enumerate(ts[:, m])
+                       if isinstance(t, datetime.datetime)]
+    times = ts[present_indices, m]
+    Fs = F_bars[present_indices, m]
+    n = -1
+    for i, ti in enumerate(times):
+        if t <= ti:
+            n = i-1
+            break
+    if n == -1:
+        if t == times[0]:
             n = 0
         else:
             raise IndexError("Data not available for this time")
-    delta = ts[n+1, m]-ts[n, m]
-    p = (t - ts[n, m])/delta
-    F_m = F_bars[n, m] * (1-p) + F_bars[n+1, m] * p
-    if L == Li[-1]:
+    F_nm, F_n1m = Fs[n], Fs[n+1]
+    t_n, t_n1 = times[n], times[n+1]
+    p = (t-t_n)/(t_n1-t_n)
+    assert(0 <= p <= 1)
+    F_m = F_nm**(1-p) * F_n1m**p
+    if L == L_m:
         return F_m
-    for i in range(ts.shape[0]):
-        if isinstance(ts[i, m+1], datetime.datetime) and isinstance(ts[i-1, m+1], datetime.datetime):
-            if t <= ts[i, m+1]:
-                n = i - 1
-                break
-    if n is None or n == -1:
-        if t == ts[0, m+1]:
+    L_m1 = Li[m+1]
+    # Now we'll consider L_{m+1}
+    present_indices = [i for i, t in enumerate(ts[:, m+1])
+                       if isinstance(t, datetime.datetime)]
+    times = ts[present_indices, m+1]
+    Fs = F_bars[present_indices, m+1]
+    n = -1
+    for i, ti in enumerate(times):
+        if t <= ti:
+            n = i - 1
+            break
+    if n == -1:
+        if t == times[0]:
             n = 0
         else:
             raise IndexError("Data not available for this time")
-    delta = ts[n + 1, m+1] - ts[n, m+1]
-    p = (t - ts[n, m+1])/delta
-    F_m1 = F_bars[n, m+1] * p + F_bars[n+1, m+1] * (1-p)
-    q = (L-Li[m])/DL
-    F = F_m * (1-q) + F_m1 * (q)
+    F_nm1, F_n1m1 = Fs[n], Fs[n+1]
+    t_n, t_n1 = times[n], times[n+1]
+    p = (t - t_n) / (t_n1 - t_n)
+    assert(0 <= p <= 1)
+    F_m1 =  F_nm1 ** (1 - p) * F_n1m1 ** p
+    # Now we interpolate between L_m and L_m+1
+    q = (L-L_m) / (L_m1 - L_m)
+    F = F_m ** (1-q) * F_m1 ** q
     return F
+
 
 def complete_PSD(Li, ts, F_bars, t_range, nTimes):
     """
@@ -195,41 +220,77 @@ def complete_PSD(Li, ts, F_bars, t_range, nTimes):
                     for t in times])
     return (times, PSD)
 
-def PSD_from_CDF(cdf_path, L_range, nL, nT, mu_, I_):
-    """
-    Takes the path to a CDF (cdf_path); a range of L values (L_range) in the
-    form of a tuple
-    """
-    cdf = pycdf.CDF(cdf_path).copy()
-    points = points_from_cdf(cdf, mu_, I_, 0.16)
-    OrbTimes = cdf["OrbTimes"]
+def process_multiple_CDFs(dir_path, L_range, DL, Dt, mu_, I_):
+    nL = int((L_range[-1] -L_range[0]) / DL) + 1
+    if dir_path[-1] == "/":
+        dir_path = dir_path[:-1]
+    files = [file for file in os.listdir(dir_path)
+             if file[:11] == "PSD_rbspb_m"]
+    cdfs = [pycdf.CDF(dir_path + "/" + file) for file in files]
+    total = {}
+    for key in cdfs[0].keys():
+        total[key] = np.concatenate([cdf[key] for cdf in cdfs], axis=0)
+    points = points_from_cdf(total, mu_, I_, 0.16)
+    OrbTimes = total["OrbTimes"]
     orbit_points = points_into_orbits(OrbTimes, points)
     Li, ts, F_bars = data_from_orbit_points(orbit_points, L_range, nL)
     t_range = find_min_max_times(ts)
+    nT = int((t_range[-1] - t_range[0]) / Dt) + 1
     return complete_PSD(Li, ts, F_bars, t_range, nT)
 
+# if __name__ == "__main__":
+    # # cdf_path = '20170908/PSD_2017251.cdf'
+    # cdf_path = '20171226/PSD_2017360.cdf'
+    # L_range = (3.1, 5.0)
+    # nL = 101
+    # nT = 101
+    #
+    # # print(datetime.datetime(2017, 9, 6, 12, 0)) # 2017-09-06 12:00:00
+    # # print(Li[46], Li[47]) # 3.982828282828283 4.002020202020202
+    # # print(ts[3,46], ts[3,47], ts[4,46], ts[4,47]) # 2017-09-06 11:24:23.207547 2017-09-06 11:25:52.105263 2017-09-06 17:09:04.020619 2017-09-06 17:08:07.894737
+    # # print(interpolated_PSD(4, datetime.datetime(2017, 9, 6, 12, 0), Li, ts, F_bars))
+    # # print(F_bars[3,46], F_bars[3,47], F_bars[4,46], F_bars[4,47])
+    #
+    # # print(complete_PSD(Li, ts, F_bars, t_range, nT))
+    #
+    # # cdf = pycdf.CDF('sep2017/PSD/PSD_rbspb_mageis_2017249.cdf').copy()
+    #
+    # times, PSD = PSD_from_CDF(cdf_path, L_range, nL, nT)
+    # # outputCDF = pycdf.CDF('20170908/output.cdf', '')
+    # outputCDF = pycdf.CDF('20171226/output.cdf', '')
+    # outputCDF["PSD"] = PSD
+    # outputCDF["Li"] = np.linspace(L_range[0], L_range[-1], nL)
+    # outputCDF["times"] = times
+    # outputCDF.close()
 
 if __name__ == "__main__":
-    # cdf_path = '20170908/PSD_2017251.cdf'
-    cdf_path = '20171226/PSD_2017360.cdf'
-    L_range = (3.1, 5.0)
-    nL = 101
-    nT = 101
+    # for dir in ["day", "week", "month", "month2"]:
+    for dir in ["month"]:
+        L_range = (3.1, 5.3)
+        DL = 0.001
+        Dt = datetime.timedelta(minutes=15)
 
-    # print(datetime.datetime(2017, 9, 6, 12, 0)) # 2017-09-06 12:00:00
-    # print(Li[46], Li[47]) # 3.982828282828283 4.002020202020202
-    # print(ts[3,46], ts[3,47], ts[4,46], ts[4,47]) # 2017-09-06 11:24:23.207547 2017-09-06 11:25:52.105263 2017-09-06 17:09:04.020619 2017-09-06 17:08:07.894737
-    # print(interpolated_PSD(4, datetime.datetime(2017, 9, 6, 12, 0), Li, ts, F_bars))
-    # print(F_bars[3,46], F_bars[3,47], F_bars[4,46], F_bars[4,47])
+        # print(datetime.datetime(2017, 9, 6, 12, 0)) # 2017-09-06 12:00:00
+        # print(Li[46], Li[47]) # 3.982828282828283 4.002020202020202
+        # print(ts[3,46], ts[3,47], ts[4,46], ts[4,47]) # 2017-09-06 11:24:23.207547 2017-09-06 11:25:52.105263 2017-09-06 17:09:04.020619 2017-09-06 17:08:07.894737
+        # print(interpolated_PSD(4, datetime.datetime(2017, 9, 6, 12, 0), Li, ts, F_bars))
+        # print(F_bars[3,46], F_bars[3,47], F_bars[4,46], F_bars[4,47])
 
-    # print(complete_PSD(Li, ts, F_bars, t_range, nT))
+        # print(complete_PSD(Li, ts, F_bars, t_range, nT))
 
-    # cdf = pycdf.CDF('sep2017/PSD/PSD_rbspb_mageis_2017249.cdf').copy()
-
-    times, PSD = PSD_from_CDF(cdf_path, L_range, nL, nT)
-    # outputCDF = pycdf.CDF('20170908/output.cdf', '')
-    outputCDF = pycdf.CDF('20171226/output.cdf', '')
-    outputCDF["PSD"] = PSD
-    outputCDF["Li"] = np.linspace(L_range[0], L_range[-1], nL)
-    outputCDF["times"] = times
-    outputCDF.close()
+        # cdf = pycdf.CDF('sep2017/PSD/PSD_rbspb_mageis_2017249.cdf').copy()
+        mu_ = 350
+        I_ = 0.1
+        mu_ = 700
+        I_ = 0.11
+        times,PSD = process_multiple_CDFs(dir + "/cdfs", L_range, DL, Dt, mu_,
+                                          I_)
+        print(times[0], times[-1])
+        # outputCDF = pycdf.CDF('20170908/output.cdf', '')
+        # outputCDF = pycdf.CDF('week/week_output.cdf', '')
+        outputCDF = pycdf.CDF(dir + '/output.cdf', '')
+        outputCDF["PSD"] = PSD
+        nL = int((L_range[-1] - L_range[0]) / DL) + 1
+        outputCDF["Li"] = np.linspace(L_range[0], L_range[-1], nL)
+        outputCDF["times"] = times
+        outputCDF.close()
