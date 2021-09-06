@@ -61,7 +61,7 @@ def points_into_orbits(OrbTimes, points):
         orbit_points[find_orbit(OrbTimes, point[0])].append(point)
     return orbit_points
 
-def data_from_orbit_points(ops, L_range, nL):
+def data_from_orbit_points(ops, L_range, nL, L_tolerance):
     """
     Takes ops (a list of the type that points_into_orbits returns), in other
     words a list of lists of points, where each sublist represents all of
@@ -81,7 +81,7 @@ def data_from_orbit_points(ops, L_range, nL):
     ts = []
     F_bars = []
     referenceDate = datetime.datetime(2000, 1, 1, 0, 0, 0, 0)
-    Li = np.linspace(L_range[0], L_range[1], nL)
+    Li = np.linspace(L_range[0], L_range[1], nL, dtype=float)
     for i in range(len(ops)):
         op = ops[i]
         # # Lstar = [point[1] for point in op]
@@ -91,10 +91,11 @@ def data_from_orbit_points(ops, L_range, nL):
         ts.append([])
         F_bars.append([])
         for L in Li:
-            ps = list(filter(lambda p: L - 0.1 <= p[1] <= L + 0.1, op))
+            ps = list(filter(lambda p: L - L_tolerance <= p[1]
+                                       <= L + L_tolerance, op))
             if len(ps) > 0:
                 t = referenceDate + sum([p[0] - referenceDate for p in ps], datetime.timedelta()) / len(ps)
-                F = np.mean([p[-1] for p in ps])
+                F = np.mean([p[-1] for p in ps], dtype=float)
             else:
                 t = datetime.datetime(datetime.MINYEAR, 1, 1)
                 F = np.nan
@@ -102,8 +103,8 @@ def data_from_orbit_points(ops, L_range, nL):
             F_bars[-1].append(F)
         # plt.plot(Li, F_bars[-1], "ro")
         # plt.show()
-    ts = np.array(ts)
-    F_bars = np.array(F_bars)
+    ts = np.array(ts, dtype=datetime.datetime)
+    F_bars = np.array(F_bars, dtype=float)
     return (Li, ts, F_bars)
 
 def find_min_max_times(ts):
@@ -123,10 +124,6 @@ def find_min_max_times(ts):
     plt.plot([i for i in range(len(mintimes))], mintimes)
     mintime = max(mintimes)
     maxtime = min(maxtimes)
-    # print(mintimes)
-    # print(np.argmax(mintimes))
-    # print(mintime)
-    # print(5/0)
     return mintime, maxtime
 
 def time_linspace(mintime, maxtime, nTimes):
@@ -218,30 +215,46 @@ def complete_PSD(Li, ts, F_bars, t_range, nTimes):
     """
     times = time_linspace(t_range[0], t_range[1], nTimes)
     PSD = np.array([[interpolated_PSD(L, t, Li, ts, F_bars) for L in Li]
-                    for t in times])
+                    for t in times], dtype=float)
     return (times, PSD)
 
-def process_multiple_CDFs(dir_path, L_range, DL, Dt, mu_, I_, tolerance):
-    nL = int((L_range[-1] -L_range[0]) / DL) + 1
+def combine_CDFs_from_dir(dir_path):
     if dir_path[-1] == "/":
         dir_path = dir_path[:-1]
     files = [file for file in os.listdir(dir_path)
              if file[:11] == "PSD_rbspb_m"]
     cdfs = [pycdf.CDF(dir_path + "/" + file) for file in files]
-    total = {}
+    combined = {}
     for key in cdfs[0].keys():
-        total[key] = np.concatenate([cdf[key] for cdf in cdfs], axis=0)
-    points = points_from_cdf(total, mu_, I_, tolerance)
-    OrbTimes = total["OrbTimes"]
+        combined[key] = np.concatenate([cdf[key] for cdf in cdfs], axis=0)
+    return combined
+
+def process_CDF_dictionary(cdf, L_range, DL, Dt, mu_, I_, L_tol):
+    nL = int((L_range[-1] - L_range[0]) / DL) + 1
+    points = points_from_cdf(cdf, mu_, I_, 0.16)
+    OrbTimes = cdf["OrbTimes"]
     orbit_points = points_into_orbits(OrbTimes, points)
-    Li, ts, F_bars = data_from_orbit_points(orbit_points, L_range, nL)
+    Li, ts, F_bars = data_from_orbit_points(orbit_points, L_range, nL, L_tol)
     t_range = find_min_max_times(ts)
     nT = int((t_range[-1] - t_range[0]) / Dt) + 1
     return complete_PSD(Li, ts, F_bars, t_range, nT)
 
+def initial_from_CDF_dictionary(cdf, L_range, DL, mu_, I_, L_tol):
+    nL = int((L_range[-1] - L_range[0]) / DL) + 1
+    points = points_from_cdf(cdf, mu_, I_, 0.16)
+    OrbTimes = cdf["OrbTimes"]
+    orbit_points = points_into_orbits(OrbTimes, points)
+    Li, ts, F_bars = data_from_orbit_points(orbit_points, L_range, nL, L_tol)
+    t_range = find_min_max_times(ts)
+    nT = 2
+    times, complete = complete_PSD(Li, ts, F_bars, t_range, 2)
+    return times[0], complete[0, :]
+
 if __name__ == "__main__":
-    # for dir in ["day", "week", "month", "month2"]:
-    for dir in ["day"]:
+    for dir in ["day", "week", "month", "month2"]:
+    # for dir in ["day"]:
+        print(dir)
+        combined = combine_CDFs_from_dir(dir + "/cdfs")
         L_range = (3.1, 5.3)
         DL = 0.01
         Dt = datetime.timedelta(minutes=15)
@@ -249,11 +262,37 @@ if __name__ == "__main__":
         # I_ = 0.1
         mu_ = 700
         I_ = 0.11
-        times,PSD = process_multiple_CDFs(dir + "/cdfs", L_range, DL, Dt, mu_,
-                                          I_, 0.16)
+        L_tol = 0.1
+        times, PSD = process_CDF_dictionary(combined, L_range, DL, Dt, mu_,
+                                            I_, L_tol)
         print(times[0], times[-1])
+        print("Making diffision_input.cdf")
         nL = int((L_range[-1] - L_range[0]) / DL) + 1
         with pycdf.CDF(dir + '/diffusion_input.cdf', '') as outputCDF:
             outputCDF["PSD"] = PSD
             outputCDF["Li"] = np.linspace(L_range[0], L_range[-1], nL)
             outputCDF["times"] = times
+
+        initial_DL = 0.01
+        L_tol = 0.1
+        time, initial = initial_from_CDF_dictionary(combined, L_range,
+                                                    initial_DL, mu_, I_, L_tol)
+        nL = int((L_range[-1] - L_range[0]) / initial_DL) + 1
+        print("Making kalman_initial.cdf")
+        with pycdf.CDF(dir + '/kalman_initial.cdf', '') as initialCDF:
+            initialCDF["time"] = np.array([time], dtype=datetime.datetime)
+            initialCDF["Li"] = np.linspace(L_range[0], L_range[-1], nL,
+                                          dtype=float)
+            initialCDF["density"] = initial
+
+        DL = 0.1
+        points = points_from_cdf(combined, mu_, I_, 0.15)
+        OrbTimes = combined["OrbTimes"]
+        orbitPoints = points_into_orbits(OrbTimes, points)
+        Li, ts, PSD = data_from_orbit_points(orbitPoints, L_range, nL, DL / 2)
+        print("Making kalman_data.cdf")
+        with pycdf.CDF(dir + '/kalman_data.cdf', '') as dataCDF:
+            dataCDF["Li"] = Li
+            dataCDF["orbits"] = OrbTimes
+            dataCDF["times"] = ts
+            dataCDF["PSD"] = PSD

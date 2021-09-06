@@ -1,3 +1,5 @@
+import random
+
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.linalg
@@ -7,7 +9,8 @@ from read_Kp import read_Kp
 from spacepy import pycdf
 from matplotlib.colors import LogNorm
 
-def solve_diffusion(LRange, tRange, nL, nT, f0, D_LL, tau, uL, uR, Kp):
+
+def solve_diffusion(LRange, tRange, nL, nT, f0, D_LL, tau, uL, uR, Kp_data):
     """
     PDE is $\frac{dF}{dt}
     =L^2\frac{d}{dL}\left(\frac{1}{L^2}D_{LL}\frac{dF}{dL}\right)
@@ -31,7 +34,7 @@ def solve_diffusion(LRange, tRange, nL, nT, f0, D_LL, tau, uL, uR, Kp):
     ui[:, 0] = initial
     for i, t in enumerate(times[1:]):
         i += 1
-        Kpt = Kp(t)
+        Kpt = Kp(Kp_data, t)
         D_LLj = np.array([(D_LL(Li[i], Kpt) + D_LL(Li[i + 1], Kpt)) / 2
                           for i in range(nL-1)], dtype=float)
         # D_LLj[i] = D_LL_{i+1/2}
@@ -78,6 +81,21 @@ def solve_diffusion(LRange, tRange, nL, nT, f0, D_LL, tau, uL, uR, Kp):
     U_final[1 : -1, :] = ui
     U_final[-1, :] = uRt
     return (Li, U_final)
+
+def kalman(LRange, tRange, nL, nT, f0, D_LL, tau, uL, uR, Kp_data, ):
+    """
+    PDE is $\frac{dF}{dt}
+    =L^2\frac{d}{dL}\left(\frac{1}{L^2}D_{LL}\frac{dF}{dL}\right)
+    -\frac{F}{tau(L)}$
+    LRange is the range of L that we are considering (a tuple)
+    tRange is the range of t that we are considering (a tuple)
+    initial condition $F(x, t_{min})=f0(x)$
+    boundary conditions are $F(x_{min}, t)=F(x_{min}, t_{min})$;
+                            $F(x_{max}, t)=F(x_{max}, t_{min})$
+    """
+    orbits =
+
+    return (Li, density)
 
 def interpolate1D(xi, fi, x):
     """
@@ -151,7 +169,20 @@ if __name__ == "__main__":
         t0 = min(Kp_data.keys())
         tf = max(Kp_data.keys())
         tRangeKp = (t0/24 + 1, tf/24 + 1) # in days
-        def Kp(t):
+
+        def perturbKp(Kp_data, perturbation=0.25):
+            print(1)
+            i=0
+            perturbed = {}
+            for t, data in Kp_data.items():
+                print(i)
+                perturbed[t] = data * random.gauss(1, perturbation)
+                i += 1
+                print(len(Kp_data), i)
+            print(1)
+            return perturbed
+
+        def Kp(Kp_data, t):
             """
             t in days
             """
@@ -177,8 +208,7 @@ if __name__ == "__main__":
             else:
                 return "infinity"
 
-        # cdf = pycdf.CDF(dir + "/output.cdf").copy()
-        cdf = pycdf.CDF(dir + "/diffusion_input.cdf").copy()
+        cdf = pycdf.CDF(dir + "/kalman_input.cdf").copy()
         cdfTimes = cdf["times"]
         jan1 = datetime.datetime(cdfTimes[0].year, 1, 1)
         LRange = (3.1, 5.3)
@@ -187,14 +217,14 @@ if __name__ == "__main__":
         tRange = (max(tRangeKp[0], tRangeCDF[0]), min(tRangeKp[1], tRangeCDF[1]))
         assert(tRange[0] <= tRange[1])
         print(tRangeKp, tRangeCDF)
-        DL = 0.001
+        DL = 0.01
         Dt = 0.01
+        epochLength = 0.1
+        nEpochs = int((LRange[-1] - LRange[0])/epochLength) + 1
+        timesPerEpoch = int(epochLength/Dt) + 1
         nL = int((LRange[-1] - LRange[0])/DL) + 1
-        nT = int((tRange[-1] - tRange[0])/Dt) + 1
         cdfLi = cdf["Li"]
         PSD = cdf["PSD"]
-
-
 
         def f0(L):
             return np.exp(interpolate1D(cdfLi, np.log(PSD[0, :]), L))
@@ -210,10 +240,9 @@ if __name__ == "__main__":
         def D_LL(L, Kpt):
             return (10**(0.506*Kpt-9.325))*L**(10)
 
-
-        modelLi, modelPSD = solve_diffusion(LRange, tRange, nL, nT, f0, D_LL, tau,
-                                          uL, uR, Kp)
-        modelTimes = np.linspace(tRange[0], tRange[1], nT)
+        modelLi, modelPSD = kalman(LRange, tRange, nL, timesPerEpoch, f0, D_LL, tau, uL,
+                                   uR, Kp_data, 4, 0.25, nEpochs)
+        modelTimes = np.linspace(tRange[0], tRange[1], nEpochs * timesPerEpoch)
 
         fig, (ax0, ax1, ax2) = plt.subplots(3, 1, figsize=(10,15))
         fig.suptitle("Model performance vs. VAP data", fontsize=16)
@@ -231,6 +260,7 @@ if __name__ == "__main__":
         X = [modelTimes for i in range(len(modelLi))]
         Y = np.transpose([modelLi for i in range(len(modelTimes))])
         Z = modelPSD
+        print(nEpochs, timesPerEpoch)
         c = ax1.pcolor(X, Y, Z, norm=LogNorm(vmin=1e-9, vmax=1e-4),
                        cmap=plt.cm.rainbow)
         fig.colorbar(c, ax=ax1)
@@ -240,6 +270,7 @@ if __name__ == "__main__":
 
         Kp_times = [t for t in Kp_data.keys() if tRange[0] <= t/24+1 <= tRange[1]]
         Kp_data = [Kp_data[t] for t in Kp_times]
+        # Kp_data = [perturbed[t] for t in Kp_times]
         assert(Kp_times != [])
         ax2.set_title("Kp data")
         ax2.plot([t/24+1 for t in Kp_times], Kp_data)
@@ -249,7 +280,7 @@ if __name__ == "__main__":
         plt.tight_layout()
         plt.savefig(dir + '/output.png')
         plt.show()
-
+        print("Done!")
 
         # n = 7
         # for i in range(n):
