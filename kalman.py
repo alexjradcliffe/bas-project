@@ -1,30 +1,59 @@
 import random
-
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.linalg
 import math
 import datetime
+import json
 from read_Kp import read_Kp
-from spacepy import pycdf
 from matplotlib.colors import LogNorm
+random.seed(100)
 
+MINTIME = datetime.datetime(datetime.MINYEAR, 1, 1)
 
-def solve_diffusion(LRange, tRange, nL, nT, f0, D_LL, tau, uL, uR, Kp_data):
+def perturb_Kp_data(Kp_data):
+    perturbed = {
+        t : min(0.1, Kp) * random.gauss(1, 0.5) for t, Kp in Kp_data.items()
+    }
+    return perturbed
+
+def solve_diffusion(L_range, t_range, nL, nT, initial, D_LL, tau, uL, uR,
+                    Kp_data):
     """
     PDE is $\frac{dF}{dt}
     =L^2\frac{d}{dL}\left(\frac{1}{L^2}D_{LL}\frac{dF}{dL}\right)
     -\frac{F}{tau(L)}$
-    LRange is the range of L that we are considering (a tuple)
-    tRange is the range of t that we are considering (a tuple)
+    L_range is the range of L that we are considering (a tuple)
+    t_range is the range of t that we are considering (a tuple)
     initial condition $F(x, t_{min})=f0(x)$
     boundary conditions are $F(x_{min}, t)=F(x_{min}, t_{min})$;
                             $F(x_{max}, t)=F(x_{max}, t_{min})$
     """
-    Li = np.linspace(LRange[0], LRange[1], num=nL)
-    times = np.linspace(tRange[0], tRange[1], num=nT)
-    DL = (LRange[1] - LRange[0])/(nL-1)
-    Dt = (tRange[1] - tRange[0])/(nT-1)
+    Kp_times = sorted(Kp_data.keys())
+    def Kp(Kp_data, t):
+        """
+        t in days
+        """
+        if t == Kp_times[-1]:
+            return Kp_data[Kp_times[-1]]
+        assert Kp_times[0] <= t <= Kp_times[-1]
+        for i, time in enumerate(Kp_times):
+            if t < time:
+                t1 = Kp_times[i-1]
+                Kp1 = Kp_data[t1]
+                t2 = time
+                Kp2 = Kp_data[t2]
+                break
+        d = (t-t1)/(t2-t1)
+        value = Kp1 * (1-d) + Kp2 * d
+        return value
+    initial_Li = np.linspace(L_range[0], L_range[1], num=initial.shape[0])
+    def f0(L):
+        return np.exp(interpolate1D(initial_Li, np.log(initial), L))
+    Li = np.linspace(L_range[0], L_range[1], num=nL)
+    times = np.linspace(t_range[0], t_range[1], num=nT)
+    DL = (L_range[1] - L_range[0])/(nL-1)
+    Dt = (t_range[1] - t_range[0])/(nT-1)
     initial = np.array([f0(L) for L in Li[1 : -1]], dtype=float)
     uLt = [uL(t) for t in times] # left boundary condition
     uRt = [uR(t) for t in times] # right boundary condition
@@ -37,13 +66,10 @@ def solve_diffusion(LRange, tRange, nL, nT, f0, D_LL, tau, uL, uR, Kp_data):
         Kpt = Kp(Kp_data, t)
         D_LLj = np.array([(D_LL(Li[i], Kpt) + D_LL(Li[i + 1], Kpt)) / 2
                           for i in range(nL-1)], dtype=float)
+        assert not np.any(np.isinf(D_LLj))
         # D_LLj[i] = D_LL_{i+1/2}
         # taui = np.array([tau(L, Kpt) for L in Li], dtype=float)
         def upsilon(L, Kpt):
-            t = tau(L, Kpt)
-            if t == "infinity":
-                return 0
-            else:
                 return 1 / t
         upsiloni = np.array([upsilon(L, Kpt) for L in Li], dtype=float)
         Xi = np.array([-Dt*Li[i+1]**2*D_LLj[i]/(DL**2*Lj[i]**2)
@@ -65,10 +91,10 @@ def solve_diffusion(LRange, tRange, nL, nT, f0, D_LL, tau, uL, uR, Kp_data):
         Ab[0, 0] = 0
         Ab[-1, -1] = 0
         # To be used in solve_banded
-        L = initial.copy()
-        L[0] -= Xi[0] * uLt[i]
-        L[-1] -= Zi[-1] * uRt[i]
-        ut = scipy.linalg.solve_banded((1, 1), Ab, L)
+        y = initial.copy()
+        y[0] -= Xi[0] * uLt[i]
+        y[-1] -= Zi[-1] * uRt[i]
+        ut = scipy.linalg.solve_banded((1, 1), Ab, y)
         ui[:, i] = ut
         initial = ut
 
@@ -80,22 +106,154 @@ def solve_diffusion(LRange, tRange, nL, nT, f0, D_LL, tau, uL, uR, Kp_data):
     U_final[0, :] = uLt
     U_final[1 : -1, :] = ui
     U_final[-1, :] = uRt
-    return (Li, U_final)
+    return (Li, U_final.transpose())
 
-def kalman(LRange, tRange, nL, nT, f0, D_LL, tau, uL, uR, Kp_data, ):
+def prediction_phase(orb_t_range, Dt, orb_boundary_times, orb_left,
+                     orb_right, nRuns, perturbed_log_initial,
+                     perturbed_Kp_data, L_range, nL, tau):
+    nT = round((orb_t_range[1] - orb_t_range[0]) / Dt) + 1
+
+    def uL(t):
+        return np.exp(interpolate1D(orb_boundary_times, orb_left, t))
+
+    def uR(t):
+        return np.exp(interpolate1D(orb_boundary_times, orb_right, t))
+
+    def D_LL(L, Kpt):
+        return (10 ** (0.506 * Kpt - 9.325)) * L ** (10)
+
+    # model_PSDs = []
+    model_log_PSDs = []
+    for j in range(nRuns):
+        run_log_initial = perturbed_log_initial[j]
+        Kp_data = perturbed_Kp_data[j]
+        model_PSD = solve_diffusion(L_range, orb_t_range, nL, nT,
+                                    np.exp(run_log_initial), D_LL, tau,
+                                    uL, uR, Kp_data)[1]
+        model_log_PSDs.append(np.log(model_PSD))
+    finals = [PSD[-1, :] for PSD in model_log_PSDs]
+    return {
+        "model_log_PSDs" : model_log_PSDs,
+        "finals" : finals,
+        "nT" : nT
+    }
+
+def analysis_phase(VAP_log, ts, orb_t_range, model_log_PSDs, finals, nRuns,
+                   H_all_data, nT):
+    P_f = np.cov(np.transpose(finals))
+    filtered_VAP_log = []
+    filtered_ts = []
+    H = []
+    for i, log in enumerate(VAP_log):
+        if not np.isnan(log):
+            filtered_VAP_log.append(log)
+            filtered_ts.append(ts[i])
+            H.append(H_all_data[i])
+
+    if H != []:
+        filtered_VAP_log = np.array(filtered_VAP_log, dtype=float)
+        H = np.array(H, dtype=float)  # projecting from model space to
+        # observation space
+        Ht = H.transpose()
+        H_inv = (np.array(H > 0, dtype=int)).transpose()
+        # maps from observation space to model space such that
+        # H @ H_inv = I
+        proj_times = H_inv @ filtered_ts  # the times of out VAP_points
+        # projected onto the model space
+        model_times = np.linspace(orb_t_range[0], orb_t_range[1], nT)
+        model_point_logs = [[interpolate1D(model_times,
+                                           model_log[:, i], t)
+                             if t != 0 else 0
+                             for i, t in enumerate(proj_times)]
+                            for model_log in model_log_PSDs]
+        average_final = np.average(finals, axis=0)
+        R = np.diag(H @ average_final) / 2
+        K = P_f @ Ht @ np.linalg.inv(H @ P_f @ Ht + R)
+        innovations = [filtered_VAP_log - H @ model_point_log
+                       for model_point_log in model_point_logs]
+        perturbed_log_initial = [finals[i] + K @ innovations[i]
+                                 for i in range(nRuns)]
+    return {
+        "innovations" : innovations,
+        "perturbed_log_initial": perturbed_log_initial
+    }
+
+def kalman(L_range, t_range, orbits, orbit_boundary_times, orbit_log_lefts,
+           orbit_log_rights, nRuns, log_initial, Kp_data, VAP_times, VAP_logs,
+           H_all_data):
     """
     PDE is $\frac{dF}{dt}
     =L^2\frac{d}{dL}\left(\frac{1}{L^2}D_{LL}\frac{dF}{dL}\right)
     -\frac{F}{tau(L)}$
-    LRange is the range of L that we are considering (a tuple)
-    tRange is the range of t that we are considering (a tuple)
+    L_range is the range of L that we are considering (a tuple)
+    t_range is the range of t that we are considering (a tuple)
     initial condition $F(x, t_{min})=f0(x)$
     boundary conditions are $F(x_{min}, t)=F(x_{min}, t_{min})$;
                             $F(x_{max}, t)=F(x_{max}, t_{min})$
     """
-    orbits =
+    Kp_times = sorted(Kp_data.keys())
+    t_range_Kp = (Kp_times[0], Kp_times[-1])
+    assert t_range_Kp[0] <= t_range[0] and t_range_Kp[1] >= t_range[1]
+    perturbed_log_initial = [np.array([f * random.gauss(1, 0.3)
+                                       for f in log_initial], dtype=float)
+                             for i in range(nRuns)]
+    perturbed_Kp_data = [perturb_Kp_data(Kp_data) for i in range(nRuns)]
+    DL = 0.01
+    # Dt = datetime.timedelta(minutes=15)
+    Dt = 0.01
+    nL = round((L_range[1]-L_range[0]) / DL) + 1
 
-    return (Li, density)
+    def tau(L, Kpt):
+        """
+        The function to be passed into the model's loss term. Taken from
+        Shprits et al. (2005) as 3/Kp, and if Kp is zero, this function returns
+        "infinity".
+        """
+        if Kpt != 0:
+            return 3 / Kpt
+        else:
+            return np.inf
+
+    average_model_logs = []
+    average_innovations = []
+
+    for o in range(len(orbits)):
+        print("o", o)
+        orb_t_range = orbits[o]
+        orb_boundary_times = orbit_boundary_times[o]
+        orb_left = orbit_log_lefts[o]
+        orb_right = orbit_log_rights[o]
+        predicted = prediction_phase(orb_t_range, Dt, orb_boundary_times,
+                                     orb_left, orb_right, nRuns,
+                                     perturbed_log_initial, perturbed_Kp_data,
+                                     L_range, nL, tau)
+        model_log_PSDs = predicted["model_log_PSDs"]
+        finals = predicted["finals"]
+        nT = predicted["nT"]
+        ts = VAP_times[o]
+        VAP_log = VAP_logs[o]
+        if np.all(np.isnan(VAP_log)):
+            perturbed_log_initial = finals
+        else:
+            analysed = analysis_phase(VAP_log, ts, orb_t_range, model_log_PSDs,
+                                      finals, nRuns, H_all_data, nT)
+            innovations = analysed["innovations"]
+            perturbed_log_initial = analysed["perturbed_log_initial"]
+            average_model_log = np.average(model_log_PSDs, axis=0)
+            average_model_logs.append(average_model_log)
+            average_innovation = np.average(innovations, axis=0)
+            innovation_iterator = (i for i in average_innovation)
+            average_innovation = []
+            for t in ts:
+                if np.isnan(t):
+                    average_innovation.append(np.nan)
+                else:
+                    average_innovation.append(next(innovation_iterator))
+            average_innovations.append(average_innovation)
+    average_model_logs = np.concatenate(average_model_logs, axis=0)
+    average_innovations = np.array(average_innovations)
+    return average_innovations, average_model_logs
+
 
 def interpolate1D(xi, fi, x):
     """
@@ -149,172 +307,93 @@ def interpolate2D(xi, yi, fi, x, y):
          + rx * (1-ry) * fi[px1, py] + rx * ry * fi[px1, py1])
     return f
 
-def timeToDays(t, jan1):
+def timeToDays(t):
     """
     Takes a time (t) in the form of datetime.datetime and returns the (float)
     number of days + 1 since midnight on 1st January of that year (jan1,
     provided as a datetime.datetime.
     """
-    delta = t-jan1
-    return delta.total_seconds()/86400 + 1
+    delta = t-MINTIME
+    return delta.total_seconds()/86400
 
 if __name__ == "__main__":
-    # for dir in ["day", "week", "month", "month2"]:
-    for dir in ["day"]:
-        # dir = "day"
-        # dir = "week"
-        # dir = "month"
-        # dir = "month2"
-        Kp_data = read_Kp(dir + "/Kp_data.lst")
-        t0 = min(Kp_data.keys())
-        tf = max(Kp_data.keys())
-        tRangeKp = (t0/24 + 1, tf/24 + 1) # in days
+    assert timeToDays(MINTIME) == 0
+    # for dir_path in ["day", "week", "month", "month2"]:
+    # for dir_path in ["day"]:
+    for dir_path in ["week"]:
+        Kp_data = read_Kp(dir_path + "/Kp_data.lst")
+        Kp_data = {timeToDays(t): Kp for t, Kp in Kp_data.items()}
+        with open(dir_path + '/kalman_data.json', "r") as inputJSON:
+            kalman_data = json.load(inputJSON)
+        L_range = kalman_data["L_range"]
+        t_range = kalman_data["t_range"]
+        orbits = kalman_data["orbits"]
+        orbit_boundary_times = [np.array(orbit, dtype=float) for orbit
+                                in kalman_data["orbit_boundary_times"]]
+        orbit_log_lefts = [np.array(orbit, dtype=float)
+                           for orbit in kalman_data["orbit_log_lefts"]]
+        orbit_log_rights = [np.array(orbit, dtype=float)
+                            for orbit in kalman_data["orbit_log_rights"]]
+        log_initial = np.array(kalman_data["log_initial"], dtype=float)
+        VAP_times = np.array(kalman_data["VAP_times"], dtype=float)
+        VAP_logs = np.array(kalman_data["VAP_logs"], dtype=float)
+        H_all_data = np.array(kalman_data["H"], dtype=float)
+        model_Li = np.array(kalman_data["model_Li"], dtype=float)
 
-        def perturbKp(Kp_data, perturbation=0.25):
-            print(1)
-            i=0
-            perturbed = {}
-            for t, data in Kp_data.items():
-                print(i)
-                perturbed[t] = data * random.gauss(1, perturbation)
-                i += 1
-                print(len(Kp_data), i)
-            print(1)
-            return perturbed
+        all_boundary_times = []
+        all_lefts = []
+        all_rights = []
+        for i, orbit in enumerate(orbit_boundary_times):
+            all_boundary_times += list(orbit)
+            all_lefts += list(orbit_log_lefts[i])
+            all_rights += list(orbit_log_rights[i])
+        boundaries = []
+        for i, t in enumerate(all_boundary_times):
+            boundaries.append((t, all_lefts[i], all_rights[i]))
+        boundaries = sorted(set(boundaries))
+        all_boundary_times = []
+        all_lefts = []
+        all_rights = []
+        for t, l, r in boundaries:
+            all_boundary_times.append(t)
+            all_lefts.append(l)
+            all_rights.append(r)
 
-        def Kp(Kp_data, t):
-            """
-            t in days
-            """
-            hour = (t - 1) * 24
-            if t == tRangeKp[1]:
-                return Kp_data[round(hour)]
-            if hour < t0 or hour > tf:
-                raise IndexError("Data not available for that time!")
-            t1 = math.floor(hour)
-            t2 = t1+1
-            d = hour - t1
-            return Kp_data[t1]*(1-d) + Kp_data[t2]*d
-
-
-        def tau(L, Kpt):
-            """
-            The function to be passed into the model's loss term. Taken from
-            Shprits et al. (2005) as 3/Kp, and if Kp is zero, this function returns
-            "infinity".
-            """
-            if Kpt != 0:
-                return 3 / Kpt
-            else:
-                return "infinity"
-
-        cdf = pycdf.CDF(dir + "/kalman_input.cdf").copy()
-        cdfTimes = cdf["times"]
-        jan1 = datetime.datetime(cdfTimes[0].year, 1, 1)
-        LRange = (3.1, 5.3)
-        cdfTimes = [timeToDays(t, jan1) for t in cdfTimes]
-        tRangeCDF = (cdfTimes[0], cdfTimes[-1])
-        tRange = (max(tRangeKp[0], tRangeCDF[0]), min(tRangeKp[1], tRangeCDF[1]))
-        assert(tRange[0] <= tRange[1])
-        print(tRangeKp, tRangeCDF)
         DL = 0.01
-        Dt = 0.01
-        epochLength = 0.1
-        nEpochs = int((LRange[-1] - LRange[0])/epochLength) + 1
-        timesPerEpoch = int(epochLength/Dt) + 1
-        nL = int((LRange[-1] - LRange[0])/DL) + 1
-        cdfLi = cdf["Li"]
-        PSD = cdf["PSD"]
-
-        def f0(L):
-            return np.exp(interpolate1D(cdfLi, np.log(PSD[0, :]), L))
+        nL = round((L_range[1] - L_range[0]) / DL) + 1
+        DT =  0.01
+        nT = round((t_range[1] - t_range[0]) / DT) + 1
+        def tau(L, Kpt):
+            return 3 / Kpt if Kpt != 0 else np.inf
 
         def uL(t):
-            return np.exp(interpolate2D(cdfTimes, cdfLi, np.log(PSD), t,
-                                        LRange[0]))
+            return np.exp(interpolate1D(all_boundary_times, all_lefts, t))
 
         def uR(t):
-            return np.exp(interpolate2D(cdfTimes, cdfLi, np.log(PSD), t,
-                                        LRange[1]))
+            return np.exp(interpolate1D(all_boundary_times, all_rights, t))
 
         def D_LL(L, Kpt):
             return (10**(0.506*Kpt-9.325))*L**(10)
 
-        modelLi, modelPSD = kalman(LRange, tRange, nL, timesPerEpoch, f0, D_LL, tau, uL,
-                                   uR, Kp_data, 4, 0.25, nEpochs)
-        modelTimes = np.linspace(tRange[0], tRange[1], nEpochs * timesPerEpoch)
+        Li, diffusion_output = solve_diffusion(L_range, t_range, nL, nT,
+                                           np.exp(log_initial), D_LL, tau,
+                                           uL, uR, Kp_data)
 
-        fig, (ax0, ax1, ax2) = plt.subplots(3, 1, figsize=(10,15))
-        fig.suptitle("Model performance vs. VAP data", fontsize=16)
-        X = [cdfTimes for i in range(len(cdfLi))]
-        Y = np.transpose([cdfLi for i in range(len(cdfTimes))])
-        Z = PSD.transpose()
-        c = ax0.pcolor(X, Y, Z, norm=LogNorm(vmin=1e-9, vmax=1e-4),
-                       cmap=plt.cm.rainbow)
 
-        fig.colorbar(c, ax=ax0)
-        ax0.set_title("VAP Phase Space Density")
-        ax0.set_xlabel("Time (days)")
-        ax0.set_ylabel('$L (R_E)$')
-
-        X = [modelTimes for i in range(len(modelLi))]
-        Y = np.transpose([modelLi for i in range(len(modelTimes))])
-        Z = modelPSD
-        print(nEpochs, timesPerEpoch)
-        c = ax1.pcolor(X, Y, Z, norm=LogNorm(vmin=1e-9, vmax=1e-4),
-                       cmap=plt.cm.rainbow)
-        fig.colorbar(c, ax=ax1)
-        ax1.set_title("Model Phase Space Density")
-        ax1.set_xlabel('Time (days)')
-        ax1.set_ylabel('$L (R_E)$')
-
-        Kp_times = [t for t in Kp_data.keys() if tRange[0] <= t/24+1 <= tRange[1]]
-        Kp_data = [Kp_data[t] for t in Kp_times]
-        # Kp_data = [perturbed[t] for t in Kp_times]
-        assert(Kp_times != [])
-        ax2.set_title("Kp data")
-        ax2.plot([t/24+1 for t in Kp_times], Kp_data)
-        ax2.set_xlabel('Time (days)')
-        ax2.set_ylabel('Kp')
-        ax2.set(xlim=(tRange[0], tRange[1]))
-        plt.tight_layout()
-        plt.savefig(dir + '/output.png')
-        plt.show()
-        print("Done!")
-
-        # n = 7
-        # for i in range(n):
-        #     j = ((nT-1) * i)//(n-1)
-        #     t = modelTimes[j]
-        #     predicted = modelPSD[:, j]
-        #     plt.plot(modelLi, predicted, "r", label = "Predicted")
-        #     actual = [interpolate1D(cdfTimes, PSD[:, k], t)
-        #               for k in range(len(PSD[0, :]))]
-        #     plt.plot(cdfLi, actual, "b", label="Actual")
-        #     plt.yscale('log')
-        #     plt.ylim(1e-10, 1e-4)
-        #     plt.xlabel("L value")
-        #     plt.ylabel("Phase Space Density")
-        #     plt.title("Phase Space Density at t=" + str(t)[:7] + " days")
-        #     plt.legend()
-        #     plt.show()
-
-        # for i in range(nL):
-        #     if i % 100 == 0:
-        #         L=np.linspace(LRange[0], LRange[1], nL)[i]
-        #         predicted = Ui[i, :]
-        #         times = np.linspace(tRange[0], tRange[1], nT)
-        #         plt.plot(times, predicted, "r",label = "Predicted")
-        #         actual = [interpolate1D(cdfLi, PSD[j, :], L)
-        #                   for j in range(len(PSD[:, 0]))]
-        #         print(len(cdfTimes), PSD.shape)
-        #         plt.plot(cdfTimes, actual, "b", label="Actual")
-        #         plt.yscale('log')
-        #         plt.ylim(1e-10, 1e-4)
-        #         plt.xlabel("L value")
-        #         plt.ylabel("Phase Space Density")
-        #         plt.title("Phase Space Density at L=" + str(L)[:7])
-        #         plt.legend()
-        #         plt.show()
-
+        kalman_stuff = kalman(L_range, t_range, orbits, orbit_boundary_times,
+                              orbit_log_lefts, orbit_log_rights, 100,
+                              log_initial, Kp_data, VAP_times, VAP_logs,
+                              H_all_data)
+        innovations, kalman_logs = kalman_stuff
+        output_dict = {"diffusion_output" : diffusion_output.tolist(),
+            "kalman_output" : kalman_logs.tolist(),
+            "innovations" : innovations.tolist(),
+        }
+        with open(dir_path + '/kalman_output.json', "w") as outputJSON:
+            kalman_data = json.dump(output_dict, outputJSON)
+        print(diffusion_output.shape)
+        print(kalman_logs.shape)
+        print(innovations)
+        print(np.nanmean(innovations, axis=0))
+        print(np.nanmean(innovations))
 

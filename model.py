@@ -238,7 +238,8 @@ if __name__ == "__main__":
         ax1.set_xlabel('Time (days)')
         ax1.set_ylabel('$L (R_E)$')
 
-        Kp_times = [t for t in Kp_data.keys() if tRange[0] <= t/24+1 <= tRange[1]]
+        Kp_times = [t for t in Kp_data.keys()
+                    if tRange[0] <= t/24+1 <= tRange[1]]
         Kp_data = [Kp_data[t] for t in Kp_times]
         assert(Kp_times != [])
         ax2.set_title("Kp data")
